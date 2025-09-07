@@ -1,159 +1,153 @@
 import pdfplumber
 import re
-import logging
+import tempfile
+import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
-
-pdf_text_store = {"text": ""}
-
 app = FastAPI(title="Invoice Extractor API")
 
-
-
-# convert PDF to Text
-
-def pdf_to_text(file_path: str) -> str:
-    logger.info(f"Extracting text from PDF: {file_path}")
-    text = ""
+# ---------------------------
+# PDF → Extract Text (full + secondary view)
+# ---------------------------
+def pdf_to_text(file_path: str):
+    full_text, meta_text = "", ""
     with pdfplumber.open(file_path) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-            logger.debug(f"Extracted page {i} text length: {len(page_text) if page_text else 0}")
-    logger.info("PDF extraction completed")
-    return text
+        for page in pdf.pages:
+            # Full page text
+            full_text += (page.extract_text() or "") + "\n"
+
+            # Secondary view (cropped region to capture extra details)
+            w, h = page.width, page.height
+            crop_box = (0, 0, w * 0.58, h)
+            meta_text += (page.crop(crop_box).extract_text() or "") + "\n"
+    return full_text, meta_text
 
 
-# Extract Invoice Data
+# ---------------------------
+# Extract Seller Details (from secondary text)
+# ---------------------------
+def extract_seller(meta_text: str):
+    lines = [l.strip() for l in meta_text.splitlines() if l.strip()]
+    seller_section, capture = [], False
+    for line in lines:
+        if re.search(r"Sold By", line, re.I):
+            capture = True
+            continue
+        if capture and re.search(r"(Billing|Shipping) Address", line, re.I):
+            break
+        if capture:
+            seller_section.append(line)
 
-def extract_invoice_data(text: str):
-    logger.info("Extracting invoice data from text")
-    data = {}
+    seller_name, seller_gst = "Not Found", "Not Found"
+    gst_pattern = re.compile(
+        r"GST(?:IN)?(?:\s*Registration\s*No)?[:\-]?\s*([0-9A-Z]{15})", re.I
+    )
 
-    try:
-        # Seller Name
-        seller_match = re.search(r"Sold By\s*[:\-]?\s*(.+)", text, re.IGNORECASE)
-        data['Seller Name'] = seller_match.group(1).strip() if seller_match else "Not Found"
+    for l in seller_section:
+        low = l.lower()
+        if not (low.startswith("pan") or low.startswith("gst")) and seller_name == "Not Found":
+            candidate = re.split(r"\*|Billing|\s{2,}", l)[0].strip()
+            seller_name = " ".join(candidate.split()[:2]) or "Not Found"
+        if seller_gst == "Not Found":
+            m = gst_pattern.search(l)
+            if m:
+                seller_gst = m.group(1).strip()
+    return seller_name, seller_gst
 
-        # Seller GST Number
-        gst_match = re.search(r"GST\s*Registration\s*No\s*[:\-]?\s*([0-9A-Z]{15})", text, re.IGNORECASE)
-        data['Seller GST Number'] = gst_match.group(1) if gst_match else "Not Found"
 
-        # Invoice Number
-        invoice_no_match = re.search(r"Invoice\s*Number\s*[:\-]?\s*(\S+)", text, re.IGNORECASE)
-        data['Invoice No'] = invoice_no_match.group(1) if invoice_no_match else "Not Found"
+# ---------------------------
+# Detect CGST/SGST Tax Rates (line by line)
+# ---------------------------
+def detect_tax_rate(full_text: str):
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    cgst_rate, sgst_rate = None, None
 
-        # Invoice Date (handles dd.mm.yyyy, dd/mm/yyyy, dd-mm-yyyy)
-        date_match = re.search(r"Invoice\s*Date\s*[:\-]?\s*([\d]{1,2}[\/\.\-][\d]{1,2}[\/\.\-][\d]{2,4})", text, re.IGNORECASE)
-        data['Invoice Date'] = date_match.group(1) if date_match else "Not Found"
+    for i, line in enumerate(lines):
+        if "CGST" in line.upper():
+            match = re.search(r"(\d{1,2})\s*%", line)
+            if not match and i + 1 < len(lines):
+                match = re.search(r"(\d{1,2})\s*%", lines[i + 1])
+            if match:
+                cgst_rate = int(match.group(1))
 
-        # Total Tax & Total Amount (same line: TOTAL: ₹79.38 ₹520.38)
-        total_line_match = re.search(r"TOTAL:\s*₹?([\d,]+\.\d{2})\s*₹?([\d,]+\.\d{2})", text, re.IGNORECASE)
-        if total_line_match:
-            data['Total Tax'] = float(total_line_match.group(1).replace(',', ''))
-            data['Total Amount'] = float(total_line_match.group(2).replace(',', ''))
-        else:
-            data['Total Tax'] = None
-            data['Total Amount'] = None
+        if "SGST" in line.upper():
+            match = re.search(r"(\d{1,2})\s*%", line)
+            if not match and i + 1 < len(lines):
+                match = re.search(r"(\d{1,2})\s*%", lines[i + 1])
+            if match:
+                sgst_rate = int(match.group(1))
 
-    except Exception as e:
-        logger.error(f"Error during regex extraction: {e}")
-        raise
-
-    logger.info("Invoice data extraction complete")
-    return data
-
-# Calculate Tax percen
-
-def calculate_tax_percent(total, tax):
-    logger.info("Calculating tax percentage")
-    if total and tax:
-        return round((tax / total) * 100, 2)
+    if cgst_rate and sgst_rate:
+        return cgst_rate  # both equal (e.g. 9%)
     return None
 
 
+# ---------------------------
+# Extract Invoice Data
+# ---------------------------
+def extract_invoice_data(full_text: str, meta_text: str) -> dict:
+    seller_name, seller_gst = extract_seller(meta_text)
 
-# Utility: Format Invoice Data for Neat Output
-
-def format_invoice_output(invoice_data: dict, filename: str) -> dict:
-    return {
-        "status": "success",
-        "file": filename,
-        "invoice": {
-            "seller_name": invoice_data.get("Seller Name"),
-            "seller_gst_number": invoice_data.get("Seller GST Number"),
-            "invoice_no": invoice_data.get("Invoice No"),
-            "invoice_date": invoice_data.get("Invoice Date"),
-            "total_tax": (
-                f"{invoice_data['Total Tax']:.2f}"
-                if invoice_data.get("Total Tax") is not None else None
-            ),
-            "total_amount": (
-                f"{invoice_data['Total Amount']:.2f}"
-                if invoice_data.get("Total Amount") is not None else None
-            ),
-            "tax_percent": (
-                f"{invoice_data['Tax %']:.2f}%"
-                if invoice_data.get("Tax %") is not None else None
-            ),
-        }
+    data = {
+        "Seller Name": seller_name,
+        "Seller GST Number": seller_gst,
+        "Invoice No": re.search(r"Invoice Number\s*:\s*([A-Z0-9\-\/]+)", full_text, re.I),
+        "Invoice Date": re.search(
+            r"Invoice Date\s*:\s*([\d]{1,2}[./-][\d]{1,2}[./-][\d]{2,4})", full_text, re.I
+        ),
     }
 
+    data["Invoice No"] = data["Invoice No"].group(1) if data["Invoice No"] else "Not Found"
+    data["Invoice Date"] = data["Invoice Date"].group(1) if data["Invoice Date"] else "Not Found"
+
+    # Totals
+    totals = re.search(r"TOTAL:\s*₹?\s*([\d,.\s]+)\s*₹?\s*([\d,.\s]+)", full_text, re.I)
+    net_match = re.search(
+        r"₹\s*([\d,]+(?:\.\d+)?)\s+\d{1,2}%\s*(IGST|CGST|SGST|GST)", full_text, re.I
+    )
+
+    net_amount = float(net_match.group(1).replace(",", "")) if net_match else None
+    tax, total_amount = (
+        (float(totals.group(1).replace(",", "")), float(totals.group(2).replace(",", "")))
+        if totals else (0.0, 0.0)
+    )
+
+    # Tax % calculation
+    tax_rate = detect_tax_rate(full_text)
+    if not tax_rate:
+        if net_amount and tax:
+            tax_rate = round((tax / net_amount) * 100, 2)
+        elif total_amount and tax:
+            net_est = max(total_amount - tax, 0.01)
+            tax_rate = round((tax / net_est) * 100, 2)
+
+    data.update({
+        "Net Amount": net_amount,
+        "Total Tax": tax,
+        "Total Amount": total_amount,
+        "Tax %": tax_rate
+    })
+    return data
+
 
 # ---------------------------
-# FastAPI Endpoint
+# API Endpoint
 # ---------------------------
-
-
 @app.post("/upload-invoice/")
 async def upload_invoice(file: UploadFile = File(...)):
-    logger.info(f"Received file upload: {file.filename}")
-
     if not file.filename.lower().endswith(".pdf"):
-        logger.warning("File is not a PDF")
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
     try:
-        # Save file temporarily
-        temp_path = f"/tmp/{file.filename}"
-        with open(temp_path, "wb") as buffer:
-            buffer.write(await file.read())
-        logger.info(f"File saved at {temp_path}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(await file.read())
+            temp_path = tmp_file.name
 
-        # Extract text & store in global safe variable
-        extracted_text = pdf_to_text(temp_path)
-        pdf_text_store["text"] = extracted_text
+        full_text, meta_text = pdf_to_text(temp_path)
+        invoice_data = extract_invoice_data(full_text, meta_text)
 
-        # Extract structured data
-        invoice_data = extract_invoice_data(extracted_text)
-        invoice_data['Tax %'] = calculate_tax_percent(
-            invoice_data['Total Amount'],
-            invoice_data['Total Tax']
-        )
-
-        logger.info("Invoice processing complete")
-        return JSONResponse(content=format_invoice_output(invoice_data, file.filename))
-
+        os.remove(temp_path)
+        return JSONResponse(content={"status": "success", "invoice": invoice_data})
     except Exception as e:
-        logger.error(f"Error processing file: {e}")
-        raise HTTPException(status_code=500, detail="Error processing invoice")
-
-
-
-# ---------------------------
-# Endpoint to fetch stored PDF text
-# ---------------------------
-@app.get("/get-pdf-text/")
-async def get_pdf_text():
-    logger.info("Fetching stored PDF text")
-    if not pdf_text_store["text"]:
-        return {"message": "No PDF text available. Upload a PDF first."}
-    return {"pdf_text": pdf_text_store["text"]}
+        raise HTTPException(status_code=500, detail=f"Error processing invoice: {str(e)}")
